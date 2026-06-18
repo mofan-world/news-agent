@@ -13,6 +13,7 @@ import smtplib
 import socket
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -69,9 +70,30 @@ class FeedError:
     message: str
 
 
+class OpenAINewsError(ValueError):
+    def __init__(self, message: str, retryable: bool = True) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+
+
+class OpenSourceNewsError(ValueError):
+    pass
+
+
 @dataclass(frozen=True)
 class Settings:
     enabled: bool
+    use_openai_news: bool
+    openai_api_key: str
+    openai_model: str
+    openai_base_url: str
+    openai_web_search_tool: str
+    use_open_source_news: bool
+    open_source_provider: str
+    open_source_base_url: str
+    open_source_model: str
+    open_source_api_key: str
+    open_source_candidate_count: int
     email_to: list[str]
     smtp_host: str
     smtp_port: int
@@ -221,6 +243,36 @@ def default_config() -> dict[str, Any]:
         "admin_password_changed": False,
         "session_secret": secrets.token_urlsafe(32),
         "enabled": True,
+        "use_openai_news": parse_env_bool("USE_OPENAI_NEWS", True),
+        "openai_api_key": os.getenv("OPENAI_API_KEY", ""),
+        "openai_model": os.getenv("OPENAI_MODEL", "gpt-4.1").strip() or "gpt-4.1",
+        "openai_base_url": os.getenv(
+            "OPENAI_BASE_URL",
+            "https://api.openai.com/v1",
+        ).rstrip("/"),
+        "openai_web_search_tool": os.getenv(
+            "OPENAI_WEB_SEARCH_TOOL",
+            "web_search",
+        ).strip() or "web_search",
+        "use_open_source_news": parse_env_bool("USE_OPEN_SOURCE_NEWS", True),
+        "open_source_provider": os.getenv(
+            "OPEN_SOURCE_PROVIDER",
+            "ollama",
+        ).strip() or "ollama",
+        "open_source_base_url": os.getenv(
+            "OPEN_SOURCE_BASE_URL",
+            "http://host.docker.internal:11434",
+        ).rstrip("/"),
+        "open_source_model": os.getenv(
+            "OPEN_SOURCE_MODEL",
+            "qwen2.5:7b",
+        ).strip() or "qwen2.5:7b",
+        "open_source_api_key": os.getenv("OPEN_SOURCE_API_KEY", ""),
+        "open_source_candidate_count": parse_env_int(
+            "OPEN_SOURCE_CANDIDATE_COUNT",
+            30,
+            minimum=10,
+        ),
         "timezone_name": os.getenv("TZ", "Asia/Shanghai").strip() or "Asia/Shanghai",
         "schedule_start_time": os.getenv("SCHEDULE_TIME", "08:30").strip() or "08:30",
         "schedule_interval_minutes": parse_env_int(
@@ -324,6 +376,28 @@ def settings_from_config(config: dict[str, Any]) -> Settings:
 
     return Settings(
         enabled=parse_bool_value(config.get("enabled"), True),
+        use_openai_news=parse_bool_value(config.get("use_openai_news"), True),
+        openai_api_key=str(config.get("openai_api_key", "")),
+        openai_model=str(config.get("openai_model", "gpt-4.1")).strip() or "gpt-4.1",
+        openai_base_url=str(
+            config.get("openai_base_url", "https://api.openai.com/v1")
+        ).strip().rstrip("/") or "https://api.openai.com/v1",
+        openai_web_search_tool=str(
+            config.get("openai_web_search_tool", "web_search")
+        ).strip() or "web_search",
+        use_open_source_news=parse_bool_value(config.get("use_open_source_news"), True),
+        open_source_provider=str(config.get("open_source_provider", "ollama")).strip()
+        or "ollama",
+        open_source_base_url=str(
+            config.get("open_source_base_url", "http://host.docker.internal:11434")
+        ).strip().rstrip("/") or "http://host.docker.internal:11434",
+        open_source_model=str(config.get("open_source_model", "qwen2.5:7b")).strip()
+        or "qwen2.5:7b",
+        open_source_api_key=str(config.get("open_source_api_key", "")),
+        open_source_candidate_count=min(100, max(
+            10,
+            int(config.get("open_source_candidate_count", 30)),
+        )),
         email_to=list(config.get("email_to") or []),
         smtp_host=str(config.get("smtp_host", "")).strip(),
         smtp_port=smtp_port,
@@ -354,6 +428,13 @@ def settings_from_config(config: dict[str, Any]) -> Settings:
 def validate_settings(settings: Settings) -> None:
     if not settings.email_to:
         raise ValueError("请至少配置一个收件邮箱。")
+    if settings.use_open_source_news:
+        if settings.open_source_provider not in {"ollama", "openai_compatible"}:
+            raise ValueError("开源大模型 Provider 只能是 ollama 或 openai_compatible。")
+        if not settings.open_source_base_url:
+            raise ValueError("缺少开源大模型 Base URL。")
+        if not settings.open_source_model:
+            raise ValueError("缺少开源大模型名称。")
     if not settings.global_feeds:
         raise ValueError("请至少配置一个全球热点 RSS 新闻源。")
     if not settings.tech_feeds:
@@ -580,6 +661,466 @@ def safe_translate(value: str, target_language: str, settings: Settings) -> str:
         return ""
 
 
+def extract_response_text(payload: dict[str, Any]) -> str:
+    output_text = payload.get("output_text")
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text.strip()
+
+    parts: list[str] = []
+    for output in payload.get("output", []) or []:
+        if not isinstance(output, dict):
+            continue
+        for content in output.get("content", []) or []:
+            if not isinstance(content, dict):
+                continue
+            text = content.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+    return "\n".join(parts).strip()
+
+
+def extract_json_payload(text: str) -> dict[str, Any]:
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            raise
+        payload = json.loads(text[start : end + 1])
+    if not isinstance(payload, dict):
+        raise ValueError("OpenAI response JSON must be an object")
+    return payload
+
+
+def openai_news_prompt(settings: Settings) -> str:
+    now = datetime.now(settings.timezone)
+    return f"""\
+请使用实时网页搜索获取新闻，并只返回 JSON，不要返回 Markdown。
+
+任务：
+1. 获取截至 {now.strftime('%Y-%m-%d %H:%M')} {settings.timezone_name} 的全球热点新闻 TOP {settings.top_n}。
+2. 获取截至 {now.strftime('%Y-%m-%d %H:%M')} {settings.timezone_name} 的科技新闻 TOP {settings.top_n}。
+3. 每条新闻必须是真实新闻，避免重复、占位页、聚合页说明、广告和“feed unavailable”内容。
+4. 新闻链接必须尽量指向原文报道或可信媒体报道。
+5. 摘要需要中英双语，中文摘要 60-120 字，英文摘要 1-2 句。
+6. 如能找到新闻图片，请给出可公开访问的 image_url；找不到则留空字符串。
+
+JSON schema:
+{{
+  "global": [
+    {{
+      "title_cn": "中文标题",
+      "title_en": "English title",
+      "summary_cn": "中文摘要",
+      "summary_en": "English summary",
+      "url": "https://...",
+      "image_url": "https://... or empty string",
+      "source": "媒体名称",
+      "published": "发布时间或 Unknown"
+    }}
+  ],
+  "technology": [
+    {{
+      "title_cn": "中文标题",
+      "title_en": "English title",
+      "summary_cn": "中文摘要",
+      "summary_en": "English summary",
+      "url": "https://...",
+      "image_url": "https://... or empty string",
+      "source": "媒体名称",
+      "published": "发布时间或 Unknown"
+    }}
+  ]
+}}
+"""
+
+
+def call_openai_responses(settings: Settings, web_search_tool: str) -> dict[str, Any]:
+    url = f"{settings.openai_base_url}/responses"
+    tool_config: dict[str, Any] = {"type": web_search_tool}
+    if web_search_tool == "web_search":
+        tool_config["search_content_types"] = ["text", "image"]
+    body = {
+        "model": settings.openai_model,
+        "input": openai_news_prompt(settings),
+        "tools": [tool_config],
+        "tool_choice": "required",
+        "max_output_tokens": 6000,
+    }
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {settings.openai_api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(
+            request,
+            timeout=max(settings.request_timeout, 60),
+        ) as response:
+            data = response.read(2 * 1024 * 1024)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read(4096).decode("utf-8", errors="replace")
+        raise parse_openai_http_error(exc.code, detail) from exc
+    return json.loads(data.decode("utf-8", errors="replace"))
+
+
+def parse_openai_http_error(status_code: int, detail: str) -> OpenAINewsError:
+    message = detail.strip()
+    code = ""
+    try:
+        payload = json.loads(detail)
+        error = payload.get("error", {}) if isinstance(payload, dict) else {}
+        if isinstance(error, dict):
+            message = str(error.get("message") or message).strip()
+            code = str(error.get("code") or error.get("type") or "").strip()
+    except json.JSONDecodeError:
+        pass
+
+    if status_code == 429 and code == "insufficient_quota":
+        return OpenAINewsError(
+            "OpenAI 额度不足或账单不可用，请检查 plan/billing；本次已自动回退 RSS 新闻源。",
+            retryable=False,
+        )
+    if status_code == 401:
+        return OpenAINewsError(
+            "OpenAI API Key 无效或未授权，请检查页面里的 OpenAI API Key。",
+            retryable=False,
+        )
+    if status_code == 403:
+        return OpenAINewsError(
+            "OpenAI 账号或模型没有权限执行该请求，请检查模型和 Web Search 权限。",
+            retryable=False,
+        )
+
+    if len(message) > 260:
+        message = message[:257].rstrip() + "..."
+    suffix = f" ({code})" if code else ""
+    return OpenAINewsError(f"OpenAI API HTTP {status_code}{suffix}: {message}")
+
+
+def call_openai_news(settings: Settings) -> dict[str, Any]:
+    tools_to_try = [settings.openai_web_search_tool]
+    if settings.openai_web_search_tool != "web_search_preview":
+        tools_to_try.append("web_search_preview")
+
+    errors: list[str] = []
+    for tool in tools_to_try:
+        try:
+            response = call_openai_responses(settings, tool)
+            text = extract_response_text(response)
+            if not text:
+                raise ValueError("OpenAI response did not include output text")
+            return extract_json_payload(text)
+        except OpenAINewsError as exc:
+            errors.append(f"{tool}: {exc}")
+            logging.warning("OpenAI news fetch skipped with %s: %s", tool, exc)
+            if not exc.retryable:
+                break
+        except (
+            OSError,
+            TimeoutError,
+            socket.timeout,
+            ValueError,
+            json.JSONDecodeError,
+        ) as exc:
+            errors.append(f"{tool}: {exc}")
+            logging.warning("OpenAI news fetch failed with %s: %s", tool, exc)
+    raise OpenAINewsError("; ".join(errors), retryable=False)
+
+
+def news_item_from_openai(record: dict[str, Any], settings: Settings) -> NewsItem | None:
+    if not isinstance(record, dict):
+        return None
+    title = str(record.get("title_cn") or record.get("title") or "").strip()
+    summary = str(record.get("summary_cn") or record.get("summary") or "").strip()
+    link = str(record.get("url") or record.get("link") or "").strip()
+    if not title or not summary or not link:
+        return None
+    if is_unavailable_feed_item(title, summary, link):
+        return None
+
+    image_url = normalize_asset_url(str(record.get("image_url") or ""), link)
+    item = NewsItem(
+        title=shorten(title, 180),
+        summary=shorten(summary, 260),
+        link=link,
+        source=str(record.get("source") or source_from_link(link) or "Unknown").strip(),
+        published=str(record.get("published") or "Unknown").strip(),
+        image_url=image_url,
+        title_en=shorten(str(record.get("title_en") or title), 180),
+        summary_en=shorten(str(record.get("summary_en") or summary), 260),
+    )
+    return enrich_news_item(item, settings)
+
+
+def collect_openai_news(
+    settings: Settings,
+) -> tuple[list[NewsItem], list[NewsItem], list[FeedError]]:
+    try:
+        payload = call_openai_news(settings)
+    except ValueError as exc:
+        return [], [], [FeedError(url="openai://responses", message=str(exc))]
+
+    global_items = [
+        item
+        for item in (
+            news_item_from_openai(record, settings)
+            for record in payload.get("global", []) or []
+        )
+        if item is not None
+    ][: settings.top_n]
+
+    tech_items = [
+        item
+        for item in (
+            news_item_from_openai(record, settings)
+            for record in payload.get("technology", []) or []
+        )
+        if item is not None
+    ][: settings.top_n]
+
+    errors: list[FeedError] = []
+    if not global_items:
+        errors.append(FeedError(url="openai://global", message="OpenAI 未返回全球热点新闻。"))
+    if not tech_items:
+        errors.append(FeedError(url="openai://technology", message="OpenAI 未返回科技新闻。"))
+    return global_items, tech_items, errors
+
+
+def news_candidates_for_model(items: list[NewsItem], limit: int) -> list[dict[str, str]]:
+    candidates: list[dict[str, str]] = []
+    for index, item in enumerate(items[:limit], 1):
+        candidates.append(
+            {
+                "id": str(index),
+                "title": item.title,
+                "summary": item.summary,
+                "url": item.link,
+                "source": item.source,
+                "published": item.published,
+                "image_url": item.image_url,
+            }
+        )
+    return candidates
+
+
+def open_source_news_prompt(
+    settings: Settings,
+    global_candidates: list[NewsItem],
+    tech_candidates: list[NewsItem],
+) -> str:
+    now = datetime.now(settings.timezone)
+    payload = {
+        "generated_at": f"{now.strftime('%Y-%m-%d %H:%M')} {settings.timezone_name}",
+        "top_n": settings.top_n,
+        "global_candidates": news_candidates_for_model(
+            global_candidates,
+            settings.open_source_candidate_count,
+        ),
+        "technology_candidates": news_candidates_for_model(
+            tech_candidates,
+            settings.open_source_candidate_count,
+        ),
+    }
+    return f"""\
+你是一个新闻编辑。请只根据下面给出的 RSS 候选新闻进行筛选、排序和摘要，不要编造候选列表以外的新闻。
+
+要求：
+1. 从 global_candidates 中选出全球热点新闻 TOP {settings.top_n}。
+2. 从 technology_candidates 中选出科技新闻 TOP {settings.top_n}。
+3. 去除重复、占位页、广告、摘要不可用内容。
+4. 每条新闻保留原始 url 和 image_url；如果候选 image_url 为空，输出空字符串。
+5. 输出中英双语标题和摘要。中文摘要 60-120 字；英文摘要 1-2 句。
+6. 只输出 JSON，不要 Markdown，不要解释。
+
+JSON schema:
+{{
+  "global": [
+    {{
+      "title_cn": "中文标题",
+      "title_en": "English title",
+      "summary_cn": "中文摘要",
+      "summary_en": "English summary",
+      "url": "候选新闻 url",
+      "image_url": "候选 image_url 或空字符串",
+      "source": "媒体名称",
+      "published": "发布时间或 Unknown"
+    }}
+  ],
+  "technology": [
+    {{
+      "title_cn": "中文标题",
+      "title_en": "English title",
+      "summary_cn": "中文摘要",
+      "summary_en": "English summary",
+      "url": "候选新闻 url",
+      "image_url": "候选 image_url 或空字符串",
+      "source": "媒体名称",
+      "published": "发布时间或 Unknown"
+    }}
+  ]
+}}
+
+候选新闻 JSON:
+{json.dumps(payload, ensure_ascii=False)}
+"""
+
+
+def post_json(
+    url: str,
+    body: dict[str, Any],
+    headers: dict[str, str],
+    timeout: int,
+    max_bytes: int = 2 * 1024 * 1024,
+) -> dict[str, Any]:
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            **headers,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            data = response.read(max_bytes)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read(2048).decode("utf-8", errors="replace")
+        detail = re.sub(r"\s+", " ", detail).strip()
+        if len(detail) > 240:
+            detail = detail[:237].rstrip() + "..."
+        raise OpenSourceNewsError(f"HTTP {exc.code}: {detail}") from exc
+    return json.loads(data.decode("utf-8", errors="replace"))
+
+
+def open_source_auth_headers(settings: Settings) -> dict[str, str]:
+    if not settings.open_source_api_key:
+        return {}
+    return {"Authorization": f"Bearer {settings.open_source_api_key}"}
+
+
+def call_ollama_news(settings: Settings, prompt: str) -> dict[str, Any]:
+    payload = post_json(
+        f"{settings.open_source_base_url}/api/chat",
+        {
+            "model": settings.open_source_model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "你是严谨的新闻编辑，只输出合法 JSON。",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            "stream": False,
+            "format": "json",
+            "options": {"temperature": 0.2},
+        },
+        open_source_auth_headers(settings),
+        timeout=max(settings.request_timeout, 120),
+    )
+    message = payload.get("message", {}) if isinstance(payload, dict) else {}
+    content = ""
+    if isinstance(message, dict):
+        content = str(message.get("content") or "")
+    content = content or str(payload.get("response") or "")
+    if not content.strip():
+        raise OpenSourceNewsError("Ollama 未返回内容。")
+    return extract_json_payload(content)
+
+
+def call_openai_compatible_news(settings: Settings, prompt: str) -> dict[str, Any]:
+    payload = post_json(
+        f"{settings.open_source_base_url}/chat/completions",
+        {
+            "model": settings.open_source_model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "你是严谨的新闻编辑，只输出合法 JSON。",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.2,
+            "response_format": {"type": "json_object"},
+        },
+        open_source_auth_headers(settings),
+        timeout=max(settings.request_timeout, 120),
+    )
+    choices = payload.get("choices", []) if isinstance(payload, dict) else []
+    if not choices:
+        raise OpenSourceNewsError("OpenAI-compatible 服务未返回 choices。")
+    message = choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
+    content = str(message.get("content") or "")
+    if not content.strip():
+        raise OpenSourceNewsError("OpenAI-compatible 服务未返回内容。")
+    return extract_json_payload(content)
+
+
+def call_open_source_news(
+    settings: Settings,
+    global_candidates: list[NewsItem],
+    tech_candidates: list[NewsItem],
+) -> dict[str, Any]:
+    if not global_candidates and not tech_candidates:
+        raise OpenSourceNewsError("没有可供开源大模型筛选的 RSS 候选新闻。")
+
+    prompt = open_source_news_prompt(settings, global_candidates, tech_candidates)
+    if settings.open_source_provider == "ollama":
+        return call_ollama_news(settings, prompt)
+    if settings.open_source_provider == "openai_compatible":
+        return call_openai_compatible_news(settings, prompt)
+    raise OpenSourceNewsError("开源大模型 Provider 只能是 ollama 或 openai_compatible。")
+
+
+def collect_open_source_news(
+    settings: Settings,
+    global_candidates: list[NewsItem],
+    tech_candidates: list[NewsItem],
+) -> tuple[list[NewsItem], list[NewsItem], list[FeedError]]:
+    try:
+        payload = call_open_source_news(settings, global_candidates, tech_candidates)
+    except (OpenSourceNewsError, OSError, TimeoutError, socket.timeout, json.JSONDecodeError) as exc:
+        return [], [], [FeedError(url="opensource://news-model", message=str(exc))]
+
+    global_items = [
+        item
+        for item in (
+            news_item_from_openai(record, settings)
+            for record in payload.get("global", []) or []
+        )
+        if item is not None
+    ][: settings.top_n]
+
+    tech_records = payload.get("technology", payload.get("tech", [])) or []
+    tech_items = [
+        item
+        for item in (
+            news_item_from_openai(record, settings)
+            for record in tech_records
+        )
+        if item is not None
+    ][: settings.top_n]
+
+    errors: list[FeedError] = []
+    if not global_items:
+        errors.append(FeedError(url="opensource://global", message="开源大模型未返回全球热点新闻。"))
+    if not tech_items:
+        errors.append(FeedError(url="opensource://technology", message="开源大模型未返回科技新闻。"))
+    return global_items, tech_items, errors
+
+
 def enrich_news_item(item: NewsItem, settings: Settings) -> NewsItem:
     title = item.title
     summary = item.summary
@@ -593,14 +1134,14 @@ def enrich_news_item(item: NewsItem, settings: Settings) -> NewsItem:
         except (OSError, TimeoutError, socket.timeout, ValueError) as exc:
             logging.debug("Article image lookup failed for %s: %s", item.link, exc)
 
-    if settings.bilingual:
+    if settings.bilingual and not (title_en and summary_en):
         source_is_cjk = contains_cjk(f"{title} {summary}")
         if source_is_cjk:
-            title_en = safe_translate(title, "en", settings) or title
-            summary_en = safe_translate(summary, "en", settings) or summary
+            title_en = title_en or safe_translate(title, "en", settings) or title
+            summary_en = summary_en or safe_translate(summary, "en", settings) or summary
         else:
-            title_en = title
-            summary_en = summary
+            title_en = title_en or title
+            summary_en = summary_en or summary
             title = safe_translate(title, "zh-CN", settings) or title
             summary = safe_translate(summary, "zh-CN", settings) or summary
 
@@ -706,6 +1247,65 @@ def collect_news(
             break
 
     return items[: settings.top_n], errors
+
+
+def collect_rss_candidates(
+    feeds: list[str],
+    settings: Settings,
+    limit: int,
+) -> tuple[list[NewsItem], list[FeedError]]:
+    seen: set[str] = set()
+    items: list[NewsItem] = []
+    errors: list[FeedError] = []
+
+    for feed in feeds:
+        try:
+            for item in fetch_feed(feed, settings):
+                key = normalize_key(item)
+                if key in seen:
+                    continue
+                seen.add(key)
+                items.append(item)
+                if len(items) >= limit:
+                    break
+        except (ET.ParseError, OSError, TimeoutError, socket.timeout, ValueError) as exc:
+            errors.append(FeedError(url=feed, message=str(exc)))
+        if len(items) >= limit:
+            break
+
+    return items, errors
+
+
+def enrich_candidate_items(
+    candidates: list[NewsItem],
+    settings: Settings,
+    limit: int,
+) -> list[NewsItem]:
+    enriched: list[NewsItem] = []
+    seen: set[str] = set()
+    for item in candidates:
+        key = normalize_key(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        enriched.append(enrich_news_item(item, settings))
+        if len(enriched) >= limit:
+            break
+    return enriched
+
+
+def merge_news_items(primary: list[NewsItem], secondary: list[NewsItem], top_n: int) -> list[NewsItem]:
+    merged: list[NewsItem] = []
+    seen: set[str] = set()
+    for item in [*primary, *secondary]:
+        key = normalize_key(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(item)
+        if len(merged) >= top_n:
+            break
+    return merged
 
 
 def render_plain_section(
@@ -946,25 +1546,92 @@ def send_email(message: EmailMessage, settings: Settings) -> None:
 def run_job(settings: Settings) -> None:
     global_feeds = expanded_feeds(settings.global_feeds, DEFAULT_GLOBAL_FEEDS)
     tech_feeds = expanded_feeds(settings.tech_feeds, DEFAULT_TECH_FEEDS)
+    errors: list[FeedError] = []
 
-    logging.info("Collecting global news from %d feed(s)", len(global_feeds))
-    global_items, global_errors = collect_news(global_feeds, settings)
+    global_items: list[NewsItem] = []
+    tech_items: list[NewsItem] = []
 
-    logging.info("Collecting technology news from %d feed(s)", len(tech_feeds))
-    tech_items, tech_errors = collect_news(tech_feeds, settings)
+    if settings.use_openai_news:
+        if settings.openai_api_key:
+            logging.info("Collecting news with OpenAI model %s", settings.openai_model)
+            global_items, tech_items, openai_errors = collect_openai_news(settings)
+            errors.extend(openai_errors)
+        else:
+            errors.append(
+                FeedError(
+                    url="openai://responses",
+                    message="未配置 OpenAI API Key，已跳过 OpenAI 并尝试开源大模型/RSS。",
+                )
+            )
+
+    needs_fallback = (
+        len(global_items) < settings.top_n
+        or len(tech_items) < settings.top_n
+    )
+    global_candidates: list[NewsItem] = []
+    tech_candidates: list[NewsItem] = []
+
+    if needs_fallback:
+        candidate_limit = max(settings.top_n, settings.open_source_candidate_count)
+        logging.info("Collecting global RSS candidates from %d feed(s)", len(global_feeds))
+        global_candidates, global_candidate_errors = collect_rss_candidates(
+            global_feeds,
+            settings,
+            candidate_limit,
+        )
+        errors.extend(global_candidate_errors)
+
+        logging.info("Collecting technology RSS candidates from %d feed(s)", len(tech_feeds))
+        tech_candidates, tech_candidate_errors = collect_rss_candidates(
+            tech_feeds,
+            settings,
+            candidate_limit,
+        )
+        errors.extend(tech_candidate_errors)
+
+    if needs_fallback and settings.use_open_source_news:
+        logging.info(
+            "Collecting news with open-source model %s via %s",
+            settings.open_source_model,
+            settings.open_source_provider,
+        )
+        open_global_items, open_tech_items, open_source_errors = collect_open_source_news(
+            settings,
+            global_candidates,
+            tech_candidates,
+        )
+        global_items = merge_news_items(global_items, open_global_items, settings.top_n)
+        tech_items = merge_news_items(tech_items, open_tech_items, settings.top_n)
+        errors.extend(open_source_errors)
+
+    if len(global_items) < settings.top_n:
+        rss_global_items = enrich_candidate_items(
+            global_candidates,
+            settings,
+            settings.top_n,
+        )
+        global_items = merge_news_items(global_items, rss_global_items, settings.top_n)
+
+    if len(tech_items) < settings.top_n:
+        rss_tech_items = enrich_candidate_items(
+            tech_candidates,
+            settings,
+            settings.top_n,
+        )
+        tech_items = merge_news_items(tech_items, rss_tech_items, settings.top_n)
 
     message = build_email(
         settings,
         global_items=global_items,
         tech_items=tech_items,
-        errors=[*global_errors, *tech_errors],
+        errors=errors,
     )
     send_email(message, settings)
     logging.info(
         "News email completed: %d global item(s), %d tech item(s), %d error(s)",
         len(global_items),
         len(tech_items),
-        len(global_errors) + len(tech_errors),
+        len(errors),
     )
 
 
@@ -1177,6 +1844,48 @@ def config_from_form(
         config["admin_password_hash"] = hash_password(new_password)
         config["admin_password_changed"] = True
 
+    config["use_openai_news"] = form_bool(fields, "use_openai_news")
+    openai_api_key = form_value(fields, "openai_api_key")
+    if openai_api_key:
+        config["openai_api_key"] = openai_api_key
+    if form_bool(fields, "clear_openai_api_key"):
+        config["openai_api_key"] = ""
+    config["openai_model"] = form_value(fields, "openai_model", "gpt-4.1")
+    config["openai_base_url"] = form_value(
+        fields,
+        "openai_base_url",
+        "https://api.openai.com/v1",
+    ).rstrip("/")
+    config["openai_web_search_tool"] = form_value(
+        fields,
+        "openai_web_search_tool",
+        "web_search",
+    )
+    config["use_open_source_news"] = form_bool(fields, "use_open_source_news")
+    config["open_source_provider"] = form_value(fields, "open_source_provider", "ollama")
+    if config["open_source_provider"] not in {"ollama", "openai_compatible"}:
+        raise ValueError("开源大模型 Provider 只能是 ollama 或 openai_compatible。")
+    config["open_source_base_url"] = form_value(
+        fields,
+        "open_source_base_url",
+        "http://host.docker.internal:11434",
+    ).rstrip("/")
+    config["open_source_model"] = form_value(
+        fields,
+        "open_source_model",
+        "qwen2.5:7b",
+    )
+    open_source_api_key = form_value(fields, "open_source_api_key")
+    if open_source_api_key:
+        config["open_source_api_key"] = open_source_api_key
+    if form_bool(fields, "clear_open_source_api_key"):
+        config["open_source_api_key"] = ""
+    config["open_source_candidate_count"] = int(
+        form_value(fields, "open_source_candidate_count", "30")
+    )
+    if config["open_source_candidate_count"] < 10 or config["open_source_candidate_count"] > 100:
+        raise ValueError("开源模型候选新闻数必须在 10 到 100 之间。")
+
     timezone_name = form_value(fields, "timezone_name", "Asia/Shanghai")
     ZoneInfo(timezone_name)
     config["timezone_name"] = timezone_name
@@ -1290,6 +1999,9 @@ def render_status(app: AgentApp, config: dict[str, Any]) -> str:
 
 def render_config_form(config: dict[str, Any], message: str = "", error: str = "") -> str:
     smtp_password_state = "已配置" if config.get("smtp_password") else "未配置"
+    openai_key_state = "已配置" if config.get("openai_api_key") else "未配置"
+    open_source_key_state = "已配置" if config.get("open_source_api_key") else "未配置"
+    open_source_provider = str(config.get("open_source_provider", "ollama"))
     message_html = f'<p class="banner ok">{html.escape(message)}</p>' if message else ""
     error_html = f'<p class="banner error">{html.escape(error)}</p>' if error else ""
     return f"""
@@ -1307,6 +2019,61 @@ def render_config_form(config: dict[str, Any], message: str = "", error: str = "
       </label>
       <label>确认新密码
         <input name="admin_password_confirm" type="password" autocomplete="new-password">
+      </label>
+    </div>
+  </section>
+
+  <section>
+    <h2>新闻获取方式</h2>
+    <label class="checkbox">
+      <input name="use_openai_news" type="checkbox"{checked(parse_bool_value(config.get("use_openai_news"), True))}>
+      使用 OpenAI 大模型获取全球热点和科技新闻 TOP10
+    </label>
+    <div class="grid two">
+      <label>OpenAI API Key（{openai_key_state}）
+        <input name="openai_api_key" type="password" autocomplete="new-password" placeholder="留空则保持不变">
+      </label>
+      <label class="checkbox compact">
+        <input name="clear_openai_api_key" type="checkbox">
+        清空已保存的 OpenAI API Key
+      </label>
+      <label>OpenAI 模型
+        <input name="openai_model" value="{html.escape(str(config.get("openai_model", "gpt-4.1")), quote=True)}" placeholder="gpt-4.1">
+      </label>
+      <label>OpenAI Base URL
+        <input name="openai_base_url" value="{html.escape(str(config.get("openai_base_url", "https://api.openai.com/v1")), quote=True)}">
+      </label>
+      <label>Web Search 工具类型
+        <input name="openai_web_search_tool" value="{html.escape(str(config.get("openai_web_search_tool", "web_search")), quote=True)}" placeholder="web_search">
+      </label>
+    </div>
+    <h2>开源大模型兜底</h2>
+    <label class="checkbox">
+      <input name="use_open_source_news" type="checkbox"{checked(parse_bool_value(config.get("use_open_source_news"), True))}>
+      OpenAI 不可用时使用开源大模型处理 RSS 候选新闻
+    </label>
+    <div class="grid two">
+      <label>Provider
+        <select name="open_source_provider">
+          <option value="ollama"{' selected' if open_source_provider == 'ollama' else ''}>Ollama</option>
+          <option value="openai_compatible"{' selected' if open_source_provider == 'openai_compatible' else ''}>OpenAI-compatible</option>
+        </select>
+      </label>
+      <label>开源模型
+        <input name="open_source_model" value="{html.escape(str(config.get("open_source_model", "qwen2.5:7b")), quote=True)}" placeholder="qwen2.5:7b">
+      </label>
+      <label>开源模型 Base URL
+        <input name="open_source_base_url" value="{html.escape(str(config.get("open_source_base_url", "http://host.docker.internal:11434")), quote=True)}">
+      </label>
+      <label>候选新闻数
+        <input name="open_source_candidate_count" type="number" min="10" max="100" value="{html.escape(str(config.get("open_source_candidate_count", 30)), quote=True)}">
+      </label>
+      <label>开源模型 API Key（{open_source_key_state}）
+        <input name="open_source_api_key" type="password" autocomplete="new-password" placeholder="本地 Ollama 通常留空">
+      </label>
+      <label class="checkbox compact">
+        <input name="clear_open_source_api_key" type="checkbox">
+        清空已保存的开源模型 API Key
       </label>
     </div>
   </section>
@@ -1476,7 +2243,7 @@ label {
   color: var(--muted);
   font-weight: 600;
 }
-input, textarea {
+input, textarea, select {
   width: 100%;
   border: 1px solid var(--border);
   border-radius: 6px;
