@@ -1824,11 +1824,25 @@ def form_bool(fields: dict[str, list[str]], name: str) -> bool:
     return name in fields
 
 
-def config_from_form(
-    current: dict[str, Any],
+CONFIG_TABS = [
+    ("schedule", "定时任务"),
+    ("news", "新闻获取"),
+    ("sender", "发件邮箱"),
+    ("recipients", "收件客户"),
+    ("content", "内容与新闻源"),
+    ("security", "登录安全"),
+]
+CONFIG_TAB_IDS = {tab_id for tab_id, _label in CONFIG_TABS}
+
+
+def normalize_config_tab(tab_id: str) -> str:
+    return tab_id if tab_id in CONFIG_TAB_IDS else "schedule"
+
+
+def update_security_config(
+    config: dict[str, Any],
     fields: dict[str, list[str]],
-) -> dict[str, Any]:
-    config = dict(current)
+) -> None:
     admin_username = form_value(fields, "admin_username")
     if not admin_username:
         raise ValueError("管理员账号不能为空。")
@@ -1844,6 +1858,11 @@ def config_from_form(
         config["admin_password_hash"] = hash_password(new_password)
         config["admin_password_changed"] = True
 
+
+def update_news_config(
+    config: dict[str, Any],
+    fields: dict[str, list[str]],
+) -> None:
     config["use_openai_news"] = form_bool(fields, "use_openai_news")
     openai_api_key = form_value(fields, "openai_api_key")
     if openai_api_key:
@@ -1886,6 +1905,11 @@ def config_from_form(
     if config["open_source_candidate_count"] < 10 or config["open_source_candidate_count"] > 100:
         raise ValueError("开源模型候选新闻数必须在 10 到 100 之间。")
 
+
+def update_schedule_config(
+    config: dict[str, Any],
+    fields: dict[str, list[str]],
+) -> None:
     timezone_name = form_value(fields, "timezone_name", "Asia/Shanghai")
     ZoneInfo(timezone_name)
     config["timezone_name"] = timezone_name
@@ -1900,12 +1924,22 @@ def config_from_form(
     if schedule_interval_minutes < 1:
         raise ValueError("相隔时间必须大于等于 1 分钟。")
     config["schedule_interval_minutes"] = schedule_interval_minutes
-
     config["enabled"] = form_bool(fields, "enabled")
+
+
+def update_recipients_config(
+    config: dict[str, Any],
+    fields: dict[str, list[str]],
+) -> None:
     config["email_to"] = parse_list(form_value(fields, "email_to"), [])
     if not config["email_to"]:
         raise ValueError("收件邮箱不能为空。")
 
+
+def update_sender_config(
+    config: dict[str, Any],
+    fields: dict[str, list[str]],
+) -> None:
     config["smtp_host"] = form_value(fields, "smtp_host")
     config["smtp_port"] = int(form_value(fields, "smtp_port", "465"))
     if config["smtp_port"] < 1:
@@ -1919,6 +1953,13 @@ def config_from_form(
         config["smtp_password"] = ""
     config["smtp_ssl"] = form_bool(fields, "smtp_ssl")
     config["smtp_starttls"] = form_bool(fields, "smtp_starttls")
+    config["dry_run"] = form_bool(fields, "dry_run")
+
+
+def update_content_config(
+    config: dict[str, Any],
+    fields: dict[str, list[str]],
+) -> None:
     config["bilingual"] = form_bool(fields, "bilingual")
     config["include_images"] = form_bool(fields, "include_images")
     config["fetch_article_images"] = form_bool(fields, "fetch_article_images")
@@ -1930,7 +1971,6 @@ def config_from_form(
     if config["request_timeout"] < 1:
         raise ValueError("请求超时必须大于等于 1 秒。")
     config["user_agent"] = form_value(fields, "user_agent", DEFAULT_USER_AGENT)
-    config["dry_run"] = form_bool(fields, "dry_run")
 
     config["global_feeds"] = parse_list(form_value(fields, "global_feeds"), [])
     config["tech_feeds"] = parse_list(form_value(fields, "tech_feeds"), [])
@@ -1938,6 +1978,29 @@ def config_from_form(
         raise ValueError("全球热点 RSS 新闻源不能为空。")
     if not config["tech_feeds"]:
         raise ValueError("科技新闻 RSS 新闻源不能为空。")
+
+
+def config_from_form(
+    current: dict[str, Any],
+    fields: dict[str, list[str]],
+) -> dict[str, Any]:
+    config = dict(current)
+    section = form_value(fields, "config_section", "all")
+    if section not in CONFIG_TAB_IDS and section != "all":
+        raise ValueError("未知配置分类。")
+
+    if section in {"all", "security"}:
+        update_security_config(config, fields)
+    if section in {"all", "news"}:
+        update_news_config(config, fields)
+    if section in {"all", "schedule"}:
+        update_schedule_config(config, fields)
+    if section in {"all", "recipients"}:
+        update_recipients_config(config, fields)
+    if section in {"all", "sender"}:
+        update_sender_config(config, fields)
+    if section in {"all", "content"}:
+        update_content_config(config, fields)
 
     settings_from_config(config)
     return config
@@ -1997,89 +2060,54 @@ def render_status(app: AgentApp, config: dict[str, Any]) -> str:
 """
 
 
-def render_config_form(config: dict[str, Any], message: str = "", error: str = "") -> str:
+def render_tab_nav(active_tab: str) -> str:
+    items = []
+    for tab_id, label in CONFIG_TABS:
+        current = tab_id == active_tab
+        css_class = "tab active" if current else "tab"
+        aria_current = ' aria-current="page"' if current else ""
+        items.append(
+            f'<a class="{css_class}" href="/?tab={html.escape(tab_id)}"'
+            f"{aria_current}>{html.escape(label)}</a>"
+        )
+    return f'<nav class="tabs" aria-label="配置分类">{"".join(items)}</nav>'
+
+
+def render_config_section_form(
+    tab_id: str,
+    title: str,
+    body: str,
+    submit_label: str,
+) -> str:
+    return f"""
+<form method="post" action="/save" class="config-form">
+  <input type="hidden" name="config_section" value="{html.escape(tab_id, quote=True)}">
+  <section class="tab-panel">
+    <h2>{html.escape(title)}</h2>
+    {body}
+    <div class="actions">
+      <button type="submit">{html.escape(submit_label)}</button>
+    </div>
+  </section>
+</form>
+"""
+
+
+def render_config_form(
+    config: dict[str, Any],
+    message: str = "",
+    error: str = "",
+    active_tab: str = "schedule",
+) -> str:
+    active_tab = normalize_config_tab(active_tab)
     smtp_password_state = "已配置" if config.get("smtp_password") else "未配置"
     openai_key_state = "已配置" if config.get("openai_api_key") else "未配置"
     open_source_key_state = "已配置" if config.get("open_source_api_key") else "未配置"
     open_source_provider = str(config.get("open_source_provider", "ollama"))
     message_html = f'<p class="banner ok">{html.escape(message)}</p>' if message else ""
     error_html = f'<p class="banner error">{html.escape(error)}</p>' if error else ""
-    return f"""
-{message_html}
-{error_html}
-<form method="post" action="/save" class="config-form">
-  <section>
-    <h2>登录设置</h2>
-    <label>管理员账号
-      <input name="admin_username" value="{html.escape(str(config.get("admin_username", "")), quote=True)}" required>
-    </label>
-    <div class="grid two">
-      <label>新管理员密码
-        <input name="admin_password" type="password" autocomplete="new-password" placeholder="留空则不修改">
-      </label>
-      <label>确认新密码
-        <input name="admin_password_confirm" type="password" autocomplete="new-password">
-      </label>
-    </div>
-  </section>
 
-  <section>
-    <h2>新闻获取方式</h2>
-    <label class="checkbox">
-      <input name="use_openai_news" type="checkbox"{checked(parse_bool_value(config.get("use_openai_news"), True))}>
-      使用 OpenAI 大模型获取全球热点和科技新闻 TOP10
-    </label>
-    <div class="grid two">
-      <label>OpenAI API Key（{openai_key_state}）
-        <input name="openai_api_key" type="password" autocomplete="new-password" placeholder="留空则保持不变">
-      </label>
-      <label class="checkbox compact">
-        <input name="clear_openai_api_key" type="checkbox">
-        清空已保存的 OpenAI API Key
-      </label>
-      <label>OpenAI 模型
-        <input name="openai_model" value="{html.escape(str(config.get("openai_model", "gpt-4.1")), quote=True)}" placeholder="gpt-4.1">
-      </label>
-      <label>OpenAI Base URL
-        <input name="openai_base_url" value="{html.escape(str(config.get("openai_base_url", "https://api.openai.com/v1")), quote=True)}">
-      </label>
-      <label>Web Search 工具类型
-        <input name="openai_web_search_tool" value="{html.escape(str(config.get("openai_web_search_tool", "web_search")), quote=True)}" placeholder="web_search">
-      </label>
-    </div>
-    <h2>开源大模型兜底</h2>
-    <label class="checkbox">
-      <input name="use_open_source_news" type="checkbox"{checked(parse_bool_value(config.get("use_open_source_news"), True))}>
-      OpenAI 不可用时使用开源大模型处理 RSS 候选新闻
-    </label>
-    <div class="grid two">
-      <label>Provider
-        <select name="open_source_provider">
-          <option value="ollama"{' selected' if open_source_provider == 'ollama' else ''}>Ollama</option>
-          <option value="openai_compatible"{' selected' if open_source_provider == 'openai_compatible' else ''}>OpenAI-compatible</option>
-        </select>
-      </label>
-      <label>开源模型
-        <input name="open_source_model" value="{html.escape(str(config.get("open_source_model", "qwen2.5:7b")), quote=True)}" placeholder="qwen2.5:7b">
-      </label>
-      <label>开源模型 Base URL
-        <input name="open_source_base_url" value="{html.escape(str(config.get("open_source_base_url", "http://host.docker.internal:11434")), quote=True)}">
-      </label>
-      <label>候选新闻数
-        <input name="open_source_candidate_count" type="number" min="10" max="100" value="{html.escape(str(config.get("open_source_candidate_count", 30)), quote=True)}">
-      </label>
-      <label>开源模型 API Key（{open_source_key_state}）
-        <input name="open_source_api_key" type="password" autocomplete="new-password" placeholder="本地 Ollama 通常留空">
-      </label>
-      <label class="checkbox compact">
-        <input name="clear_open_source_api_key" type="checkbox">
-        清空已保存的开源模型 API Key
-      </label>
-    </div>
-  </section>
-
-  <section>
-    <h2>定时任务</h2>
+    schedule_body = f"""
     <label class="checkbox">
       <input name="enabled" type="checkbox"{checked(parse_bool_value(config.get("enabled"), True))}>
       启用定时发送
@@ -2095,13 +2123,68 @@ def render_config_form(config: dict[str, Any], message: str = "", error: str = "
         <input name="schedule_interval_minutes" type="number" min="1" value="{html.escape(str(config.get("schedule_interval_minutes", 1440)), quote=True)}" required>
       </label>
     </div>
-  </section>
+    """
 
-  <section>
-    <h2>邮件配置</h2>
-    <label>收件邮箱（多个邮箱用逗号或换行分隔）
-      <textarea name="email_to" required>{html.escape(textarea_value(list(config.get("email_to") or [])))}</textarea>
-    </label>
+    news_body = f"""
+    <div class="form-block">
+      <h3>OpenAI</h3>
+      <label class="checkbox">
+        <input name="use_openai_news" type="checkbox"{checked(parse_bool_value(config.get("use_openai_news"), True))}>
+        使用 OpenAI 大模型获取全球热点和科技新闻 TOP10
+      </label>
+      <div class="grid two">
+        <label>OpenAI API Key（{openai_key_state}）
+          <input name="openai_api_key" type="password" autocomplete="new-password" placeholder="留空则保持不变">
+        </label>
+        <label class="checkbox compact">
+          <input name="clear_openai_api_key" type="checkbox">
+          清空已保存的 OpenAI API Key
+        </label>
+        <label>OpenAI 模型
+          <input name="openai_model" value="{html.escape(str(config.get("openai_model", "gpt-4.1")), quote=True)}" placeholder="gpt-4.1">
+        </label>
+        <label>OpenAI Base URL
+          <input name="openai_base_url" value="{html.escape(str(config.get("openai_base_url", "https://api.openai.com/v1")), quote=True)}">
+        </label>
+        <label>Web Search 工具类型
+          <input name="openai_web_search_tool" value="{html.escape(str(config.get("openai_web_search_tool", "web_search")), quote=True)}" placeholder="web_search">
+        </label>
+      </div>
+    </div>
+    <div class="form-block">
+      <h3>开源大模型兜底</h3>
+      <label class="checkbox">
+        <input name="use_open_source_news" type="checkbox"{checked(parse_bool_value(config.get("use_open_source_news"), True))}>
+        OpenAI 不可用时使用开源大模型处理 RSS 候选新闻
+      </label>
+      <div class="grid two">
+        <label>Provider
+          <select name="open_source_provider">
+            <option value="ollama"{' selected' if open_source_provider == 'ollama' else ''}>Ollama</option>
+            <option value="openai_compatible"{' selected' if open_source_provider == 'openai_compatible' else ''}>OpenAI-compatible</option>
+          </select>
+        </label>
+        <label>开源模型
+          <input name="open_source_model" value="{html.escape(str(config.get("open_source_model", "qwen2.5:7b")), quote=True)}" placeholder="qwen2.5:7b">
+        </label>
+        <label>开源模型 Base URL
+          <input name="open_source_base_url" value="{html.escape(str(config.get("open_source_base_url", "http://host.docker.internal:11434")), quote=True)}">
+        </label>
+        <label>候选新闻数
+          <input name="open_source_candidate_count" type="number" min="10" max="100" value="{html.escape(str(config.get("open_source_candidate_count", 30)), quote=True)}">
+        </label>
+        <label>开源模型 API Key（{open_source_key_state}）
+          <input name="open_source_api_key" type="password" autocomplete="new-password" placeholder="本地 Ollama 通常留空">
+        </label>
+        <label class="checkbox compact">
+          <input name="clear_open_source_api_key" type="checkbox">
+          清空已保存的开源模型 API Key
+        </label>
+      </div>
+    </div>
+    """
+
+    sender_body = f"""
     <div class="grid two">
       <label>SMTP 服务器
         <input name="smtp_host" value="{html.escape(str(config.get("smtp_host", "")), quote=True)}" placeholder="smtp.126.com">
@@ -2137,51 +2220,114 @@ def render_config_form(config: dict[str, Any], message: str = "", error: str = "
         只生成内容不发送邮件
       </label>
     </div>
-  </section>
+    """
 
-  <section>
-    <h2>邮件内容</h2>
-    <div class="checks">
-      <label class="checkbox">
-        <input name="bilingual" type="checkbox"{checked(parse_bool_value(config.get("bilingual"), True))}>
-        中英双语摘要
-      </label>
-      <label class="checkbox">
-        <input name="include_images" type="checkbox"{checked(parse_bool_value(config.get("include_images"), True))}>
-        邮件中显示新闻图片
-      </label>
-      <label class="checkbox">
-        <input name="fetch_article_images" type="checkbox"{checked(parse_bool_value(config.get("fetch_article_images"), True))}>
-        RSS 无图时从原文页面补图
-      </label>
-    </div>
-  </section>
-
-  <section>
-    <h2>新闻源</h2>
-    <div class="grid two">
-      <label>全球热点 RSS
-        <textarea name="global_feeds" required>{html.escape(textarea_value(list(config.get("global_feeds") or [])))}</textarea>
-      </label>
-      <label>科技新闻 RSS
-        <textarea name="tech_feeds" required>{html.escape(textarea_value(list(config.get("tech_feeds") or [])))}</textarea>
-      </label>
-      <label>每类新闻条数
-        <input name="top_n" type="number" min="1" max="50" value="{html.escape(str(config.get("top_n", 10)), quote=True)}">
-      </label>
-      <label>请求超时（秒）
-        <input name="request_timeout" type="number" min="1" value="{html.escape(str(config.get("request_timeout", 20)), quote=True)}">
-      </label>
-    </div>
-    <label>User-Agent
-      <input name="user_agent" value="{html.escape(str(config.get("user_agent", DEFAULT_USER_AGENT)), quote=True)}">
+    recipients_body = f"""
+    <label>收件邮箱（多个邮箱用逗号或换行分隔）
+      <textarea name="email_to" required>{html.escape(textarea_value(list(config.get("email_to") or [])))}</textarea>
     </label>
-  </section>
+    """
 
-  <div class="actions">
-    <button type="submit">保存配置</button>
-  </div>
-</form>
+    content_body = f"""
+    <div class="form-block">
+      <h3>邮件内容</h3>
+      <div class="checks">
+        <label class="checkbox">
+          <input name="bilingual" type="checkbox"{checked(parse_bool_value(config.get("bilingual"), True))}>
+          中英双语摘要
+        </label>
+        <label class="checkbox">
+          <input name="include_images" type="checkbox"{checked(parse_bool_value(config.get("include_images"), True))}>
+          邮件中显示新闻图片
+        </label>
+        <label class="checkbox">
+          <input name="fetch_article_images" type="checkbox"{checked(parse_bool_value(config.get("fetch_article_images"), True))}>
+          RSS 无图时从原文页面补图
+        </label>
+      </div>
+    </div>
+    <div class="form-block">
+      <h3>新闻源</h3>
+      <div class="grid two">
+        <label>全球热点 RSS
+          <textarea name="global_feeds" required>{html.escape(textarea_value(list(config.get("global_feeds") or [])))}</textarea>
+        </label>
+        <label>科技新闻 RSS
+          <textarea name="tech_feeds" required>{html.escape(textarea_value(list(config.get("tech_feeds") or [])))}</textarea>
+        </label>
+        <label>每类新闻条数
+          <input name="top_n" type="number" min="1" max="50" value="{html.escape(str(config.get("top_n", 10)), quote=True)}">
+        </label>
+        <label>请求超时（秒）
+          <input name="request_timeout" type="number" min="1" value="{html.escape(str(config.get("request_timeout", 20)), quote=True)}">
+        </label>
+      </div>
+      <label>User-Agent
+        <input name="user_agent" value="{html.escape(str(config.get("user_agent", DEFAULT_USER_AGENT)), quote=True)}">
+      </label>
+    </div>
+    """
+
+    security_body = f"""
+    <label>管理员账号
+      <input name="admin_username" value="{html.escape(str(config.get("admin_username", "")), quote=True)}" required>
+    </label>
+    <div class="grid two">
+      <label>新管理员密码
+        <input name="admin_password" type="password" autocomplete="new-password" placeholder="留空则不修改">
+      </label>
+      <label>确认新密码
+        <input name="admin_password_confirm" type="password" autocomplete="new-password">
+      </label>
+    </div>
+    """
+
+    tab_forms = {
+        "schedule": render_config_section_form(
+            "schedule",
+            "定时任务",
+            schedule_body,
+            "保存定时任务",
+        ),
+        "news": render_config_section_form(
+            "news",
+            "新闻获取",
+            news_body,
+            "保存新闻获取",
+        ),
+        "sender": render_config_section_form(
+            "sender",
+            "发件邮箱",
+            sender_body,
+            "保存发件邮箱",
+        ),
+        "recipients": render_config_section_form(
+            "recipients",
+            "收件客户",
+            recipients_body,
+            "保存收件客户",
+        ),
+        "content": render_config_section_form(
+            "content",
+            "内容与新闻源",
+            content_body,
+            "保存内容与新闻源",
+        ),
+        "security": render_config_section_form(
+            "security",
+            "登录安全",
+            security_body,
+            "保存登录安全",
+        ),
+    }
+
+    return f"""
+{message_html}
+{error_html}
+<div class="config-shell">
+  {render_tab_nav(active_tab)}
+  {tab_forms[active_tab]}
+</div>
 
 <form method="post" action="/run-now" class="inline-action">
   <button type="submit" class="secondary">立即运行一次</button>
@@ -2226,6 +2372,35 @@ main {
   margin: 0 auto;
   padding: 24px;
 }
+.config-shell {
+  margin-bottom: 16px;
+}
+.tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 12px;
+}
+.tab {
+  display: inline-flex;
+  align-items: center;
+  min-height: 40px;
+  padding: 9px 14px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  background: #fff;
+  text-decoration: none;
+  font-weight: 700;
+}
+.tab:hover {
+  border-color: #93a4b8;
+}
+.tab.active {
+  color: #fff;
+  background: var(--accent);
+  border-color: var(--accent);
+}
 section {
   background: var(--panel);
   border: 1px solid var(--border);
@@ -2233,9 +2408,24 @@ section {
   padding: 18px;
   margin-bottom: 16px;
 }
+.tab-panel {
+  margin-bottom: 0;
+}
 h2 {
   font-size: 16px;
   margin: 0 0 14px;
+}
+h3 {
+  font-size: 15px;
+  margin: 0 0 12px;
+}
+.form-block {
+  padding-top: 2px;
+}
+.form-block + .form-block {
+  border-top: 1px solid var(--border);
+  margin-top: 18px;
+  padding-top: 18px;
 }
 label {
   display: grid;
@@ -2412,6 +2602,7 @@ class AgentHandler(BaseHTTPRequestHandler):
             return
         if route.path == "/":
             query = urllib.parse.parse_qs(route.query)
+            active_tab = normalize_config_tab(form_value(query, "tab", "schedule"))
             message = ""
             if "saved" in query:
                 message = "配置已保存，定时器已重新计算。"
@@ -2421,7 +2612,7 @@ class AgentHandler(BaseHTTPRequestHandler):
                 message = "已有任务正在运行，本次手动运行未启动。"
             elif "invalid" in query:
                 message = "配置不完整，未启动运行。请先补齐页面中的邮件配置。"
-            self.render_dashboard(message=message)
+            self.render_dashboard(message=message, active_tab=active_tab)
             return
         self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -2453,12 +2644,18 @@ class AgentHandler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length).decode("utf-8")
         return urllib.parse.parse_qs(raw, keep_blank_values=True)
 
-    def render_dashboard(self, message: str = "", error: str = "") -> None:
+    def render_dashboard(
+        self,
+        message: str = "",
+        error: str = "",
+        active_tab: str = "schedule",
+    ) -> None:
         config = self.app.config_store.load()
         body = render_status(self.app, config) + render_config_form(
             config,
             message=message,
             error=error,
+            active_tab=active_tab,
         )
         self.send_html(page("新闻 Agent 配置", body), HTTPStatus.OK)
 
@@ -2492,17 +2689,21 @@ class AgentHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def handle_save(self) -> None:
+        active_tab = "schedule"
         try:
             fields = self.read_form()
+            active_tab = normalize_config_tab(
+                form_value(fields, "config_section", "schedule")
+            )
             current = self.app.config_store.load()
             config = config_from_form(current, fields)
             self.app.config_store.save(config)
             self.app.wake_scheduler()
         except Exception as exc:
             logging.exception("Failed to save config")
-            self.render_dashboard(error=str(exc))
+            self.render_dashboard(error=str(exc), active_tab=active_tab)
             return
-        self.redirect("/?saved=1")
+        self.redirect(f"/?saved=1&tab={urllib.parse.quote(active_tab)}")
 
     def require_auth(self) -> bool:
         token = self.session_token()
