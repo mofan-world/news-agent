@@ -50,6 +50,8 @@ MAX_FORM_BYTES = 256 * 1024
 MAX_ARTICLE_BYTES = 512 * 1024
 MAX_TRANSLATION_BYTES = 512 * 1024
 MAX_TRANSLATION_CHARS = 900
+MAX_WECOM_RESPONSE_BYTES = 512 * 1024
+MAX_WECOM_MARKDOWN_BYTES = 3900
 
 
 @dataclass(frozen=True)
@@ -80,6 +82,10 @@ class OpenSourceNewsError(ValueError):
     pass
 
 
+class WeComError(ValueError):
+    pass
+
+
 @dataclass(frozen=True)
 class Settings:
     enabled: bool
@@ -94,6 +100,7 @@ class Settings:
     open_source_model: str
     open_source_api_key: str
     open_source_candidate_count: int
+    email_enabled: bool
     email_to: list[str]
     smtp_host: str
     smtp_port: int
@@ -102,6 +109,12 @@ class Settings:
     smtp_from: str
     smtp_ssl: bool
     smtp_starttls: bool
+    wecom_enabled: bool
+    wecom_corp_id: str
+    wecom_agent_id: int
+    wecom_app_secret: str
+    wecom_to_users: list[str]
+    wecom_api_base_url: str
     schedule_hour: int
     schedule_minute: int
     schedule_interval_minutes: int
@@ -280,6 +293,7 @@ def default_config() -> dict[str, Any]:
             1440,
             minimum=1,
         ),
+        "email_enabled": parse_env_bool("EMAIL_ENABLED", True),
         "email_to": parse_list(os.getenv("EMAIL_TO"), ["swh_2018@126.com"]),
         "smtp_host": os.getenv("SMTP_HOST", "").strip(),
         "smtp_port": parse_env_int("SMTP_PORT", 465, minimum=1),
@@ -288,6 +302,15 @@ def default_config() -> dict[str, Any]:
         "smtp_from": smtp_from,
         "smtp_ssl": parse_env_bool("SMTP_SSL", True),
         "smtp_starttls": parse_env_bool("SMTP_STARTTLS", False),
+        "wecom_enabled": parse_env_bool("WECOM_ENABLED", False),
+        "wecom_corp_id": os.getenv("WECOM_CORP_ID", "").strip(),
+        "wecom_agent_id": parse_env_int("WECOM_AGENT_ID", 0, minimum=0),
+        "wecom_app_secret": os.getenv("WECOM_APP_SECRET", ""),
+        "wecom_to_users": parse_list(os.getenv("WECOM_TO_USERS"), []),
+        "wecom_api_base_url": os.getenv(
+            "WECOM_API_BASE_URL",
+            "https://qyapi.weixin.qq.com/cgi-bin",
+        ).strip().rstrip("/") or "https://qyapi.weixin.qq.com/cgi-bin",
         "global_feeds": parse_list(os.getenv("GLOBAL_FEEDS"), DEFAULT_GLOBAL_FEEDS),
         "tech_feeds": parse_list(os.getenv("TECH_FEEDS"), DEFAULT_TECH_FEEDS),
         "top_n": parse_env_int("TOP_N", 10, minimum=1),
@@ -398,6 +421,7 @@ def settings_from_config(config: dict[str, Any]) -> Settings:
             10,
             int(config.get("open_source_candidate_count", 30)),
         )),
+        email_enabled=parse_bool_value(config.get("email_enabled"), True),
         email_to=list(config.get("email_to") or []),
         smtp_host=str(config.get("smtp_host", "")).strip(),
         smtp_port=smtp_port,
@@ -407,6 +431,14 @@ def settings_from_config(config: dict[str, Any]) -> Settings:
         or str(config.get("smtp_username", "")).strip(),
         smtp_ssl=parse_bool_value(config.get("smtp_ssl"), True),
         smtp_starttls=parse_bool_value(config.get("smtp_starttls"), False),
+        wecom_enabled=parse_bool_value(config.get("wecom_enabled"), False),
+        wecom_corp_id=str(config.get("wecom_corp_id", "")).strip(),
+        wecom_agent_id=int(config.get("wecom_agent_id", 0) or 0),
+        wecom_app_secret=str(config.get("wecom_app_secret", "")),
+        wecom_to_users=list(config.get("wecom_to_users") or []),
+        wecom_api_base_url=str(
+            config.get("wecom_api_base_url", "https://qyapi.weixin.qq.com/cgi-bin")
+        ).strip().rstrip("/") or "https://qyapi.weixin.qq.com/cgi-bin",
         schedule_hour=schedule_hour,
         schedule_minute=schedule_minute,
         schedule_interval_minutes=interval_minutes,
@@ -426,8 +458,6 @@ def settings_from_config(config: dict[str, Any]) -> Settings:
 
 
 def validate_settings(settings: Settings) -> None:
-    if not settings.email_to:
-        raise ValueError("请至少配置一个收件邮箱。")
     if settings.use_open_source_news:
         if settings.open_source_provider not in {"ollama", "openai_compatible"}:
             raise ValueError("开源大模型 Provider 只能是 ollama 或 openai_compatible。")
@@ -439,20 +469,40 @@ def validate_settings(settings: Settings) -> None:
         raise ValueError("请至少配置一个全球热点 RSS 新闻源。")
     if not settings.tech_feeds:
         raise ValueError("请至少配置一个科技新闻 RSS 新闻源。")
+    if not settings.email_enabled and not settings.wecom_enabled:
+        raise ValueError("请至少启用一种发送方式：邮件或企业微信。")
+    if settings.email_enabled and not settings.email_to:
+        raise ValueError("请至少配置一个收件邮箱。")
+    if settings.wecom_enabled and not settings.wecom_to_users:
+        raise ValueError("请至少配置一个企业微信接收用户 UserID。")
     if settings.dry_run:
         return
 
-    missing = []
-    if not settings.smtp_host:
-        missing.append("SMTP 服务器")
-    if not settings.smtp_from:
-        missing.append("发件邮箱")
-    if not settings.smtp_username:
-        missing.append("SMTP 账号")
-    if not settings.smtp_password:
-        missing.append("SMTP 密码/授权码")
-    if missing:
-        raise ValueError("缺少邮件配置：" + "、".join(missing))
+    if settings.email_enabled:
+        missing = []
+        if not settings.smtp_host:
+            missing.append("SMTP 服务器")
+        if not settings.smtp_from:
+            missing.append("发件邮箱")
+        if not settings.smtp_username:
+            missing.append("SMTP 账号")
+        if not settings.smtp_password:
+            missing.append("SMTP 密码/授权码")
+        if missing:
+            raise ValueError("缺少邮件配置：" + "、".join(missing))
+
+    if settings.wecom_enabled:
+        missing = []
+        if not settings.wecom_corp_id:
+            missing.append("企业微信 CorpID")
+        if settings.wecom_agent_id < 1:
+            missing.append("企业微信 AgentID")
+        if not settings.wecom_app_secret:
+            missing.append("企业微信应用 Secret")
+        if not settings.wecom_api_base_url:
+            missing.append("企业微信 API Base URL")
+        if missing:
+            raise ValueError("缺少企业微信配置：" + "、".join(missing))
 
 
 def html_to_text(value: str) -> str:
@@ -1543,6 +1593,227 @@ def send_email(message: EmailMessage, settings: Settings) -> None:
         smtp.send_message(message)
 
 
+def wecom_get_json(url: str, settings: Settings) -> dict[str, Any]:
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": settings.user_agent,
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(
+            request,
+            timeout=settings.request_timeout,
+        ) as response:
+            data = response.read(MAX_WECOM_RESPONSE_BYTES + 1)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read(2048).decode("utf-8", errors="replace")
+        detail = re.sub(r"\s+", " ", detail).strip()
+        raise WeComError(f"企业微信 API HTTP {exc.code}: {detail}") from exc
+    except (OSError, TimeoutError, socket.timeout) as exc:
+        raise WeComError(f"企业微信 API 请求失败：{exc}") from exc
+    if len(data) > MAX_WECOM_RESPONSE_BYTES:
+        raise WeComError("企业微信 API 响应过大。")
+    try:
+        return json.loads(data.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError as exc:
+        raise WeComError("企业微信 API 返回了非 JSON 内容。") from exc
+
+
+def wecom_post_json(
+    url: str,
+    body: dict[str, Any],
+    settings: Settings,
+) -> dict[str, Any]:
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "User-Agent": settings.user_agent,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(
+            request,
+            timeout=settings.request_timeout,
+        ) as response:
+            data = response.read(MAX_WECOM_RESPONSE_BYTES + 1)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read(2048).decode("utf-8", errors="replace")
+        detail = re.sub(r"\s+", " ", detail).strip()
+        raise WeComError(f"企业微信 API HTTP {exc.code}: {detail}") from exc
+    except (OSError, TimeoutError, socket.timeout) as exc:
+        raise WeComError(f"企业微信 API 请求失败：{exc}") from exc
+    if len(data) > MAX_WECOM_RESPONSE_BYTES:
+        raise WeComError("企业微信 API 响应过大。")
+    try:
+        return json.loads(data.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError as exc:
+        raise WeComError("企业微信 API 返回了非 JSON 内容。") from exc
+
+
+def check_wecom_response(payload: dict[str, Any], action: str) -> None:
+    errcode = int(payload.get("errcode", 0) or 0)
+    if errcode != 0:
+        errmsg = str(payload.get("errmsg", "未知错误"))
+        raise WeComError(f"{action}失败：{errcode} {errmsg}")
+
+
+def fetch_wecom_access_token(settings: Settings) -> str:
+    query = urllib.parse.urlencode(
+        {
+            "corpid": settings.wecom_corp_id,
+            "corpsecret": settings.wecom_app_secret,
+        }
+    )
+    payload = wecom_get_json(
+        f"{settings.wecom_api_base_url}/gettoken?{query}",
+        settings,
+    )
+    check_wecom_response(payload, "获取企业微信 access_token")
+    token = str(payload.get("access_token", ""))
+    if not token:
+        raise WeComError("获取企业微信 access_token 失败：响应中没有 access_token。")
+    return token
+
+
+def markdown_link_label(value: str) -> str:
+    value = re.sub(r"\s+", " ", value).strip()
+    return value.replace("[", "【").replace("]", "】")
+
+
+def markdown_item_block(index: int, item: NewsItem, settings: Settings) -> str:
+    title = shorten(item.title, 80)
+    summary = shorten(item.summary, 170)
+    if item.link:
+        lines = [f"{index}. [{markdown_link_label(title)}]({item.link})"]
+    else:
+        lines = [f"{index}. {title}"]
+    if summary:
+        lines.append(f"   摘要：{summary}")
+    if settings.bilingual:
+        english_title = shorten(item.title_en, 80)
+        english_summary = shorten(item.summary_en, 150)
+        if english_title:
+            lines.append(f"   EN：{english_title}")
+        if english_summary:
+            lines.append(f"   Summary：{english_summary}")
+    meta = " · ".join(
+        part
+        for part in [item.source or "Unknown", item.published or "Unknown"]
+        if part
+    )
+    if meta:
+        lines.append(f"   来源：{meta}")
+    return "\n".join(lines)
+
+
+def markdown_byte_len(value: str) -> int:
+    return len(value.encode("utf-8"))
+
+
+def append_wecom_chunks(
+    chunks: list[str],
+    header: str,
+    blocks: list[str],
+) -> None:
+    chunk = header
+    for block in blocks:
+        candidate = f"{chunk}\n\n{block}" if chunk else block
+        if markdown_byte_len(candidate) <= MAX_WECOM_MARKDOWN_BYTES:
+            chunk = candidate
+            continue
+        if chunk.strip():
+            chunks.append(chunk)
+        next_chunk = f"{header}\n\n{block}" if header else block
+        if markdown_byte_len(next_chunk) <= MAX_WECOM_MARKDOWN_BYTES:
+            chunk = next_chunk
+        elif markdown_byte_len(block) <= MAX_WECOM_MARKDOWN_BYTES:
+            chunk = block
+        else:
+            chunks.append(block.encode("utf-8")[:MAX_WECOM_MARKDOWN_BYTES].decode(
+                "utf-8",
+                errors="ignore",
+            ))
+            chunk = header
+    if chunk.strip():
+        chunks.append(chunk)
+
+
+def build_wecom_markdown_chunks(
+    settings: Settings,
+    global_items: list[NewsItem],
+    tech_items: list[NewsItem],
+    errors: list[FeedError],
+) -> list[str]:
+    now = datetime.now(settings.timezone)
+    stamp = now.strftime("%Y-%m-%d %H:%M")
+    title = (
+        f"# 每日新闻简报\n"
+        f"> {stamp} · {settings.timezone_name}\n"
+        f"> 全球热点 TOP{settings.top_n} + 科技新闻 TOP{settings.top_n}"
+    )
+    chunks: list[str] = []
+    global_blocks = [
+        markdown_item_block(index, item, settings)
+        for index, item in enumerate(global_items, start=1)
+    ]
+    tech_blocks = [
+        markdown_item_block(index, item, settings)
+        for index, item in enumerate(tech_items, start=1)
+    ]
+    append_wecom_chunks(chunks, f"{title}\n\n## 一、全球热点 TOP {settings.top_n}", global_blocks)
+    append_wecom_chunks(chunks, f"## 二、科技新闻 TOP {settings.top_n}", tech_blocks)
+    if errors:
+        error_blocks = [
+            f"- {shorten(error.url, 90)}：{shorten(error.message, 150)}"
+            for error in errors[:10]
+        ]
+        append_wecom_chunks(chunks, "## 抓取提示", error_blocks)
+    return chunks
+
+
+def send_wecom_markdown(
+    settings: Settings,
+    global_items: list[NewsItem],
+    tech_items: list[NewsItem],
+    errors: list[FeedError],
+) -> None:
+    chunks = build_wecom_markdown_chunks(settings, global_items, tech_items, errors)
+    if settings.dry_run:
+        logging.info("DRY_RUN enabled; WeCom markdown content follows.")
+        for index, chunk in enumerate(chunks, start=1):
+            print(f"\n--- WeCom markdown message {index}/{len(chunks)} ---")
+            print(chunk)
+        return
+
+    access_token = fetch_wecom_access_token(settings)
+    target_users = "|".join(settings.wecom_to_users)
+    for index, chunk in enumerate(chunks, start=1):
+        payload = {
+            "touser": target_users,
+            "msgtype": "markdown",
+            "agentid": settings.wecom_agent_id,
+            "markdown": {
+                "content": chunk,
+            },
+        }
+        response = wecom_post_json(
+            f"{settings.wecom_api_base_url}/message/send?"
+            f"{urllib.parse.urlencode({'access_token': access_token})}",
+            payload,
+            settings,
+        )
+        check_wecom_response(response, f"发送企业微信消息 {index}/{len(chunks)}")
+        invalid_users = str(response.get("invaliduser", "")).strip()
+        if invalid_users:
+            logging.warning("WeCom message sent with invalid user(s): %s", invalid_users)
+
+
 def run_job(settings: Settings) -> None:
     global_feeds = expanded_feeds(settings.global_feeds, DEFAULT_GLOBAL_FEEDS)
     tech_feeds = expanded_feeds(settings.tech_feeds, DEFAULT_TECH_FEEDS)
@@ -1620,18 +1891,33 @@ def run_job(settings: Settings) -> None:
         )
         tech_items = merge_news_items(tech_items, rss_tech_items, settings.top_n)
 
-    message = build_email(
-        settings,
-        global_items=global_items,
-        tech_items=tech_items,
-        errors=errors,
-    )
-    send_email(message, settings)
+    if settings.email_enabled:
+        message = build_email(
+            settings,
+            global_items=global_items,
+            tech_items=tech_items,
+            errors=errors,
+        )
+        send_email(message, settings)
+
+    if settings.wecom_enabled:
+        send_wecom_markdown(
+            settings,
+            global_items=global_items,
+            tech_items=tech_items,
+            errors=errors,
+        )
+
     logging.info(
-        "News email completed: %d global item(s), %d tech item(s), %d error(s)",
+        (
+            "News delivery completed: %d global item(s), %d tech item(s), "
+            "%d error(s), email=%s, wecom=%s"
+        ),
         len(global_items),
         len(tech_items),
         len(errors),
+        "enabled" if settings.email_enabled else "disabled",
+        "enabled" if settings.wecom_enabled else "disabled",
     )
 
 
@@ -1828,6 +2114,7 @@ CONFIG_TABS = [
     ("schedule", "定时任务"),
     ("news", "新闻获取"),
     ("sender", "发件邮箱"),
+    ("wecom", "企业微信"),
     ("recipients", "收件客户"),
     ("content", "内容与新闻源"),
     ("security", "登录安全"),
@@ -1940,6 +2227,7 @@ def update_sender_config(
     config: dict[str, Any],
     fields: dict[str, list[str]],
 ) -> None:
+    config["email_enabled"] = form_bool(fields, "email_enabled")
     config["smtp_host"] = form_value(fields, "smtp_host")
     config["smtp_port"] = int(form_value(fields, "smtp_port", "465"))
     if config["smtp_port"] < 1:
@@ -1954,6 +2242,28 @@ def update_sender_config(
     config["smtp_ssl"] = form_bool(fields, "smtp_ssl")
     config["smtp_starttls"] = form_bool(fields, "smtp_starttls")
     config["dry_run"] = form_bool(fields, "dry_run")
+
+
+def update_wecom_config(
+    config: dict[str, Any],
+    fields: dict[str, list[str]],
+) -> None:
+    config["wecom_enabled"] = form_bool(fields, "wecom_enabled")
+    config["wecom_corp_id"] = form_value(fields, "wecom_corp_id")
+    config["wecom_agent_id"] = int(form_value(fields, "wecom_agent_id", "0") or "0")
+    if config["wecom_agent_id"] < 0:
+        raise ValueError("企业微信 AgentID 不能小于 0。")
+    wecom_app_secret = form_value(fields, "wecom_app_secret")
+    if wecom_app_secret:
+        config["wecom_app_secret"] = wecom_app_secret
+    if form_bool(fields, "clear_wecom_app_secret"):
+        config["wecom_app_secret"] = ""
+    config["wecom_to_users"] = parse_list(form_value(fields, "wecom_to_users"), [])
+    config["wecom_api_base_url"] = form_value(
+        fields,
+        "wecom_api_base_url",
+        "https://qyapi.weixin.qq.com/cgi-bin",
+    ).rstrip("/")
 
 
 def update_content_config(
@@ -1999,6 +2309,8 @@ def config_from_form(
         update_recipients_config(config, fields)
     if section in {"all", "sender"}:
         update_sender_config(config, fields)
+    if section in {"all", "wecom"}:
+        update_wecom_config(config, fields)
     if section in {"all", "content"}:
         update_content_config(config, fields)
 
@@ -2031,8 +2343,14 @@ def render_status(app: AgentApp, config: dict[str, Any]) -> str:
         config_class = "warn"
 
     next_run = state["next_run"]
+    delivery_channels = []
+    if parse_bool_value(config.get("email_enabled"), True):
+        delivery_channels.append("邮件")
+    if parse_bool_value(config.get("wecom_enabled"), False):
+        delivery_channels.append("企业微信")
     rows = [
         ("任务状态", "启用" if parse_bool_value(config.get("enabled"), True) else "已停用"),
+        ("发送方式", "、".join(delivery_channels) if delivery_channels else "未启用"),
         ("配置检查", config_status),
         ("下一次运行", format_dt(next_run)),
         ("当前运行", state["current_source"] if state["running"] else "无"),
@@ -2103,6 +2421,7 @@ def render_config_form(
     smtp_password_state = "已配置" if config.get("smtp_password") else "未配置"
     openai_key_state = "已配置" if config.get("openai_api_key") else "未配置"
     open_source_key_state = "已配置" if config.get("open_source_api_key") else "未配置"
+    wecom_secret_state = "已配置" if config.get("wecom_app_secret") else "未配置"
     open_source_provider = str(config.get("open_source_provider", "ollama"))
     message_html = f'<p class="banner ok">{html.escape(message)}</p>' if message else ""
     error_html = f'<p class="banner error">{html.escape(error)}</p>' if error else ""
@@ -2185,6 +2504,10 @@ def render_config_form(
     """
 
     sender_body = f"""
+    <label class="checkbox">
+      <input name="email_enabled" type="checkbox"{checked(parse_bool_value(config.get("email_enabled"), True))}>
+      启用邮件发送
+    </label>
     <div class="grid two">
       <label>SMTP 服务器
         <input name="smtp_host" value="{html.escape(str(config.get("smtp_host", "")), quote=True)}" placeholder="smtp.126.com">
@@ -2217,9 +2540,37 @@ def render_config_form(
       </label>
       <label class="checkbox">
         <input name="dry_run" type="checkbox"{checked(parse_bool_value(config.get("dry_run"), False))}>
-        只生成内容不发送邮件
+        只生成内容不发送
       </label>
     </div>
+    """
+
+    wecom_body = f"""
+    <label class="checkbox">
+      <input name="wecom_enabled" type="checkbox"{checked(parse_bool_value(config.get("wecom_enabled"), False))}>
+      启用企业微信应用消息发送
+    </label>
+    <div class="grid two">
+      <label>企业微信 CorpID
+        <input name="wecom_corp_id" value="{html.escape(str(config.get("wecom_corp_id", "")), quote=True)}" placeholder="wwxxxxxxxxxxxxxxxx">
+      </label>
+      <label>企业微信 AgentID
+        <input name="wecom_agent_id" type="number" min="0" value="{html.escape(str(config.get("wecom_agent_id", 0)), quote=True)}" placeholder="1000002">
+      </label>
+      <label>应用 Secret（{wecom_secret_state}）
+        <input name="wecom_app_secret" type="password" autocomplete="new-password" placeholder="留空则保持不变">
+      </label>
+      <label class="checkbox compact">
+        <input name="clear_wecom_app_secret" type="checkbox">
+        清空已保存的应用 Secret
+      </label>
+      <label>API Base URL
+        <input name="wecom_api_base_url" value="{html.escape(str(config.get("wecom_api_base_url", "https://qyapi.weixin.qq.com/cgi-bin")), quote=True)}">
+      </label>
+    </div>
+    <label>接收用户 UserID（多个用户用逗号或换行分隔）
+      <textarea name="wecom_to_users" placeholder="zhangsan&#10;lisi">{html.escape(textarea_value(list(config.get("wecom_to_users") or [])))}</textarea>
+    </label>
     """
 
     recipients_body = f"""
@@ -2300,6 +2651,12 @@ def render_config_form(
             "发件邮箱",
             sender_body,
             "保存发件邮箱",
+        ),
+        "wecom": render_config_section_form(
+            "wecom",
+            "企业微信",
+            wecom_body,
+            "保存企业微信",
         ),
         "recipients": render_config_section_form(
             "recipients",
@@ -2579,6 +2936,16 @@ class AgentHTTPServer(ThreadingHTTPServer):
     app: AgentApp
 
 
+def find_verification_file(name: str) -> Path | None:
+    if not re.fullmatch(r"WW_verify_[A-Za-z0-9]+\.txt", name):
+        return None
+    candidates = [Path.cwd() / name, Path(__file__).resolve().parents[2] / name]
+    for path in candidates:
+        if path.is_file():
+            return path
+    return None
+
+
 class AgentHandler(BaseHTTPRequestHandler):
     server: AgentHTTPServer
 
@@ -2591,6 +2958,12 @@ class AgentHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         route = urllib.parse.urlparse(self.path)
+        verification_file = find_verification_file(
+            Path(urllib.parse.unquote(route.path)).name
+        )
+        if verification_file:
+            self.send_plain_file(verification_file)
+            return
         if route.path == "/login":
             self.send_html(login_page(), HTTPStatus.OK)
             return
@@ -2736,6 +3109,14 @@ class AgentHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def send_plain_file(self, path: Path) -> None:
+        data = path.read_bytes()
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
 
 
 def run_web_server(app: AgentApp) -> None:

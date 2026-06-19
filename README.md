@@ -1,6 +1,6 @@
 # 新闻 Agent
 
-一个可容器化部署的新闻邮件 Agent。服务启动后提供 HTTP 配置页面，登录后可以配置定时任务、新闻源、收件客户邮箱、SMTP 发件账号和密码/授权码。
+一个可容器化部署的新闻 Agent。服务启动后提供 HTTP 配置页面，登录后可以配置定时任务、新闻源、邮件发送、企业微信发送、收件客户和登录安全。
 
 默认新闻获取链路：
 
@@ -86,8 +86,10 @@ Provider：OpenAI-compatible
 - 定时任务是否启用
 - 起始时间，例如 `08:30`
 - 相隔时间，单位分钟，例如 `1440` 表示每天一次，`720` 表示每 12 小时一次
+- 发送方式：邮件、企业微信，支持同时启用
 - 收件客户邮箱，支持逗号或换行分隔多个邮箱
 - SMTP 服务器、端口、账号、密码/授权码、发件邮箱
+- 企业微信 CorpID、AgentID、应用 Secret、接收用户 UserID
 - 全球热点 RSS 新闻源、科技新闻 RSS 新闻源
 - 每类新闻条数
 - 是否生成中英双语摘要
@@ -129,6 +131,21 @@ customer2@example.com
 - 如果 RSS 没有图片，并启用了“从原文页面补图”，Agent 会尝试读取原文页面的 `og:image` 或 `twitter:image`
 
 部分邮箱客户端可能默认拦截远程图片，需要点击“显示图片”。
+
+## 企业微信发送
+
+在页面的“企业微信”页签中填写：
+
+```text
+启用企业微信应用消息发送：勾选
+企业微信 CorpID：企业微信后台的企业 ID
+企业微信 AgentID：自建应用的 AgentId
+应用 Secret：自建应用的 Secret
+接收用户 UserID：通讯录里的 UserID，多个用户用逗号或换行分隔
+API Base URL：https://qyapi.weixin.qq.com/cgi-bin
+```
+
+Agent 会调用企业微信接口获取 `access_token`，然后用应用消息的 `markdown` 类型发送“全球热点 TOP10”和“科技新闻 TOP10”。如果同时启用了邮件和企业微信，两种渠道都会发送。
 
 ## 126 邮箱发件说明
 
@@ -230,14 +247,21 @@ docker compose up -d --build
 | `BILINGUAL_EMAIL` | `true` | 首次启动是否生成中英双语摘要 |
 | `INCLUDE_IMAGES` | `true` | 首次启动是否在邮件中显示新闻图片 |
 | `FETCH_ARTICLE_IMAGES` | `true` | RSS 无图时是否尝试从原文页面补图 |
+| `EMAIL_ENABLED` | `true` | 首次启动是否启用邮件发送 |
 | `EMAIL_TO` | `swh_2018@126.com` | 首次启动收件邮箱 |
 | `SMTP_HOST` | 空 | 首次启动 SMTP 服务器 |
 | `SMTP_PORT` | `465` | 首次启动 SMTP 端口 |
 | `SMTP_USERNAME` | 空 | 首次启动 SMTP 账号 |
 | `SMTP_PASSWORD` | 空 | 首次启动 SMTP 密码/授权码 |
 | `SMTP_FROM` | SMTP 账号 | 首次启动发件邮箱 |
+| `WECOM_ENABLED` | `false` | 首次启动是否启用企业微信发送 |
+| `WECOM_CORP_ID` | 空 | 企业微信 CorpID |
+| `WECOM_AGENT_ID` | `0` | 企业微信自建应用 AgentID |
+| `WECOM_APP_SECRET` | 空 | 企业微信自建应用 Secret |
+| `WECOM_TO_USERS` | 空 | 企业微信接收用户 UserID，多个用逗号分隔 |
+| `WECOM_API_BASE_URL` | `https://qyapi.weixin.qq.com/cgi-bin` | 企业微信 API Base URL |
 | `RUN_ONCE` | `false` | 启动后只运行一次，不启动页面和调度器 |
-| `DRY_RUN` | `false` | 只打印邮件内容，不发送 |
+| `DRY_RUN` | `false` | 只打印发送内容，不调用邮件或企业微信发送接口 |
 
 ## Docker Hub 连接失败
 
