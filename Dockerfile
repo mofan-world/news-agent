@@ -11,7 +11,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY src ./src
-COPY WW_verify_u6b1njoAirZrz9ot.txt ./
+COPY WW_verify_JKB36UVGcbueWppd.txt ./
 
 VOLUME ["/data"]
 EXPOSE 8080
